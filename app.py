@@ -1,36 +1,17 @@
-import sqlite3, os
-from datetime import datetime, timedelta
-from pathlib import Path
+import os
+from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from typing import Optional
+from supabase import create_client
 import uvicorn
 
-BASE_DIR = Path(__file__).parent
-DB_PATH = BASE_DIR / "records.db"
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "changeme")
 
-def init_db():
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.execute("""CREATE TABLE IF NOT EXISTS records (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        app_name TEXT NOT NULL,
-        event TEXT NOT NULL,
-        timestamp TEXT NOT NULL)""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS device_status (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        battery TEXT,
-        location TEXT,
-        device TEXT,
-        weather TEXT,
-        brightness TEXT,
-        volume TEXT,
-        timestamp TEXT NOT NULL)""")
-    conn.commit()
-    conn.close()
-
-init_db()
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 app = FastAPI(title="查岗系统")
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
@@ -52,16 +33,21 @@ async def report(body: ReportBody, req: Request):
     if auth != f"Bearer {AUTH_TOKEN}":
         raise HTTPException(401, "Unauthorized")
     now = datetime.utcnow().isoformat()
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.execute("INSERT INTO records (app_name, event, timestamp) VALUES (?, ?, ?)",
-        (body.app_name, body.event, now))
+    supabase.table("records").insert({
+        "app_name": body.app_name,
+        "event": body.event,
+        "timestamp": now
+    }).execute()
     if any([body.battery, body.location, body.device, body.weather, body.brightness, body.volume]):
-        conn.execute("""INSERT INTO device_status 
-            (battery, location, device, weather, brightness, volume, timestamp) 
-            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (body.battery, body.location, body.device, body.weather, body.brightness, body.volume, now))
-    conn.commit()
-    conn.close()
+        supabase.table("device_status").insert({
+            "battery": body.battery,
+            "location": body.location,
+            "device": body.device,
+            "weather": body.weather,
+            "brightness": body.brightness,
+            "volume": body.volume,
+            "timestamp": now
+        }).execute()
     return {"status": "ok"}
 
 @app.get("/ping")
@@ -70,35 +56,31 @@ async def ping():
 
 @app.get("/activity/summary")
 async def summary():
-    conn = sqlite3.connect(str(DB_PATH))
-    cur = conn.cursor()
-    cur.execute("SELECT app_name, event, timestamp FROM records ORDER BY id DESC LIMIT 5")
-    recent = cur.fetchall()
-    cur.execute("SELECT app_name, event, timestamp FROM records ORDER BY id ASC")
-    rows = cur.fetchall()
-    # 获取最新设备状态
-    cur.execute("SELECT battery, location, device, weather, brightness, volume, timestamp FROM device_status ORDER BY id DESC LIMIT 1")
-    status = cur.fetchone()
-    conn.close()
+    recent_res = supabase.table("records").select("app_name, event, timestamp").order("id", desc=True).limit(5).execute()
+    recent = recent_res.data
+    all_res = supabase.table("records").select("app_name, event, timestamp").order("id").execute()
+    rows = all_res.data
+    status_res = supabase.table("device_status").select("*").order("id", desc=True).limit(1).execute()
+    status = status_res.data[0] if status_res.data else None
     sessions, opens = {}, {}
     for r in rows:
-        app_name, ev, ts = r
+        app_name, ev, ts = r["app_name"], r["event"], r["timestamp"]
         if ev == "open":
             opens[app_name] = datetime.fromisoformat(ts)
         elif ev == "close" and app_name in opens:
             gap = int((datetime.fromisoformat(ts) - opens[app_name]).total_seconds())
             sessions[app_name] = sessions.get(app_name, 0) + gap
             del opens[app_name]
-    result = {"recent_apps": [r[0] for r in recent], "sessions": sessions}
+    result = {"recent_apps": [r["app_name"] for r in recent], "sessions": sessions}
     if status:
         result["device_status"] = {
-            "battery": status[0],
-            "location": status[1],
-            "device": status[2],
-            "weather": status[3],
-            "brightness": status[4],
-            "volume": status[5],
-            "last_report": status[6]
+            "battery": status.get("battery"),
+            "location": status.get("location"),
+            "device": status.get("device"),
+            "weather": status.get("weather"),
+            "brightness": status.get("brightness"),
+            "volume": status.get("volume"),
+            "last_report": status.get("timestamp")
         }
     return result
 
